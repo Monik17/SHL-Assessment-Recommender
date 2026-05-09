@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-import anthropic
+import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -63,9 +63,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Anthropic client ─────────────────────────────────────────────────────────
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
+client = genai.GenerativeModel("gemini-1.5-flash")
 
 # ─── RAG: simple keyword + semantic retrieval ─────────────────────────────────
 
@@ -266,16 +266,12 @@ def chat(request: ChatRequest) -> ChatResponse:
     api_messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1500,
-            system=system_prompt,
-            messages=api_messages,
-        )
+        conversation_text = "\n".join(f"{m['role']}: {m['content']}" for m in api_messages)
+        response = client.generate_content(system_prompt + "\n\n" + conversation_text)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM error: {str(e)}")
 
-    raw = response.content[0].text
+    raw = response.text
 
     try:
         parsed = parse_llm_response(raw)
