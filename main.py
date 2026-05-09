@@ -1,7 +1,7 @@
 """
 SHL Conversational Assessment Recommender
 FastAPI service with GET /health and POST /chat endpoints.
-Uses Claude claude-sonnet-4-20250514 + RAG over scraped SHL catalog.
+Uses Gemini 1.5 Flash (free) + RAG over scraped SHL catalog.
 """
 
 import json
@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -63,9 +63,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Gemini client ─────────────────────────────────────────────────────────────
 
-genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
-client = genai.GenerativeModel("gemini-1.5-flash")
+client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY", ""))
 
 # ─── RAG: simple keyword + semantic retrieval ─────────────────────────────────
 
@@ -101,7 +101,6 @@ def _score_assessment(assessment: dict, query_lower: str, keywords: list[str]) -
 def retrieve_assessments(query: str, top_k: int = 15) -> list[dict]:
     """Retrieve top-k assessments relevant to the query."""
     q = query.lower()
-    # Extract meaningful keywords
     stopwords = {"a", "an", "the", "and", "or", "for", "to", "in", "of", "with",
                  "that", "is", "are", "we", "need", "want", "hire", "hiring",
                  "looking", "i", "our", "some", "can", "would", "like", "please",
@@ -188,7 +187,6 @@ You ONLY cover Individual Test Solutions. Pre-packaged Job Solutions are OUT OF 
 
 def build_system_prompt(messages: list[Message]) -> str:
     """Build RAG-enhanced system prompt from conversation context."""
-    # Combine all user messages for retrieval
     user_text = " ".join(m.content for m in messages if m.role == "user")
     retrieved = retrieve_assessments(user_text, top_k=20)
     snippet = format_catalog_snippet(retrieved) if retrieved else "No specific matches found — use full catalog names below."
@@ -198,11 +196,9 @@ def build_system_prompt(messages: list[Message]) -> str:
 
 def parse_llm_response(raw: str) -> dict:
     """Extract JSON from LLM response, handling markdown fences."""
-    # Strip markdown code fences if present
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip()
     cleaned = re.sub(r"```\s*$", "", cleaned).strip()
 
-    # Find the first { ... } block
     start = cleaned.find("{")
     end = cleaned.rfind("}") + 1
     if start == -1 or end == 0:
@@ -222,7 +218,6 @@ def validate_recommendations(recs: list[dict]) -> list[Recommendation]:
         url = r.get("url", "")
         test_type = r.get("test_type", "")
 
-        # Check by name (case-insensitive)
         if name.lower() in catalog_by_name:
             a = catalog_by_name[name.lower()]
             valid.append(Recommendation(
@@ -237,9 +232,8 @@ def validate_recommendations(recs: list[dict]) -> list[Recommendation]:
                 url=a["url"],
                 test_type=test_type or (a["test_types"][0] if a["test_types"] else "K"),
             ))
-        # else: skip invalid recommendation (not in catalog)
 
-    return valid[:10]  # cap at 10
+    return valid[:10]
 
 
 @app.get("/health")
@@ -252,8 +246,7 @@ def chat(request: ChatRequest) -> ChatResponse:
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages cannot be empty")
 
-    # Enforce turn cap
-    if len(request.messages) > 16:  # 8 turns * 2 (user+assistant)
+    if len(request.messages) > 16:
         return ChatResponse(
             reply="This conversation has reached the maximum length. Please start a new session.",
             recommendations=[],
@@ -262,12 +255,14 @@ def chat(request: ChatRequest) -> ChatResponse:
 
     system_prompt = build_system_prompt(request.messages)
 
-    # Convert to Anthropic message format
-    api_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    # Build conversation text for Gemini
+    conversation_text = "\n".join(f"{m.role}: {m.content}" for m in request.messages)
 
     try:
-        conversation_text = "\n".join(f"{m['role']}: {m['content']}" for m in api_messages)
-        response = client.generate_content(system_prompt + "\n\n" + conversation_text)
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=system_prompt + "\n\n" + conversation_text,
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM error: {str(e)}")
 
@@ -276,7 +271,6 @@ def chat(request: ChatRequest) -> ChatResponse:
     try:
         parsed = parse_llm_response(raw)
     except (json.JSONDecodeError, ValueError) as e:
-        # Fallback: return raw as reply with no recommendations
         return ChatResponse(
             reply=raw,
             recommendations=[],
